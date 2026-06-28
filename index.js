@@ -32,6 +32,24 @@ let config = loadConfig();
 let isConnected = false;
 let sock;
 
+// ─── CONVERSATION MEMORY ──────────────────────────────────────────────────────
+// Har contact ki recent chat history yaad rakhne ke liye — RAM mein (server restart
+// hone pe reset ho jayegi, woh normal hai). Isi se bot ko "context" milta hai.
+const chatHistory = new Map();      // number -> [{ role: "user"|"model", text }]
+const MAX_TURNS = 10;               // last 10 messages (5 user + 5 bot) yaad rakhega
+
+function getHistory(number) {
+    if (!chatHistory.has(number)) chatHistory.set(number, []);
+    return chatHistory.get(number);
+}
+
+function pushHistory(number, role, text) {
+    const hist = getHistory(number);
+    hist.push({ role, text });
+    // Purani history trim karo — sirf last MAX_TURNS rakho
+    while (hist.length > MAX_TURNS) hist.shift();
+}
+
 // ─── ARISE APP AUTH MIDDLEWARE ────────────────────────────────────────────────
 // Ye middleware ensure karta hai ki sirf registered Arise app hi API call kar sake
 // Bina valid arise_app_token ke koi bhi API kaam nahi karega
@@ -56,7 +74,7 @@ function ariseAuth(req, res, next) {
 // ─── BEHAVIOUR ENGINE ─────────────────────────────────────────────────────────
 // Relationship type ke hisaab se AI ka behaviour decide hota hai
 
-function getSystemPrompt(contactType, contactName, incomingText) {
+function getSystemPrompt(contactType, contactName) {
     const name = contactName || "yaar";
     
     const behaviours = {
@@ -102,12 +120,11 @@ IMPORTANT RULES — in ko kabhi mat todna:
 2. EMOJI — kabhi kabhi use kar, har message pe nahi. Real log aise nahi karte.
 3. HINGLISH — Hindi words, English script mein. Pure English mat bol.
 4. NATURAL — AI jaisa mat lag. Real insaan ki tarah soch ke bol.
-5. CONTEXT — jo usne kaha hai usi pe react kar, random baatein mat karo.
+5. CONTEXT — niche jo conversation history hai usse dhyan se padh aur usi ke hisaab se react kar. Pehle kya baat hui thi wo yaad rakh — naam, topic, mood sab continue rakhna hai.
 6. QUESTION — kabhi kabhi counter question kar — real conversation hoti hai.
+7. REPEAT MAT KAR — agar pehle kuch pucha/bola ja chuka hai, usko dobara mat pucho jaise pehli baar pucha ja raha ho.
 
-Usne ye message bheja hai: "${incomingText}"
-
-Ab ek natural, short reply de. Sirf reply text — koi explanation nahi.`;
+Tujhe sirf reply text dena hai — koi explanation, koi prefix, kuch nahi. Sirf wahi bolna jo tu directly bhejega.`;
 }
 
 // ─── WHATSAPP BOT ─────────────────────────────────────────────────────────────
@@ -203,14 +220,27 @@ async function startBot() {
 
         console.log(`💬 [${contactConfig.type}] ${realNum}: ${text}`);
 
-        const systemPrompt = getSystemPrompt(contactConfig.type, contactConfig.name, text);
+        const systemPrompt = getSystemPrompt(contactConfig.type, contactConfig.name);
+
+        // Is contact ki purani history nikalo aur naya user message add karo
+        pushHistory(realNum, "user", text);
+        const history = getHistory(realNum);
+
+        // Gemini ke format mein convert karo: history ka pehla message system instruction ke saath jaata hai
+        const geminiContents = history.map((h, i) => ({
+            role: h.role === "user" ? "user" : "model",
+            parts: [{ text: h.text }]
+        }));
 
         // Gemini ko call karo — overload (503) ya temporary errors pe retry karo
         async function callGemini(retriesLeft = 2) {
             try {
                 const response = await axios.post(
                     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${config.gemini_key}`,
-                    { contents: [{ parts: [{ text: systemPrompt }] }] },
+                    {
+                        system_instruction: { parts: [{ text: systemPrompt }] },
+                        contents: geminiContents
+                    },
                     { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
                 );
                 return response;
@@ -233,6 +263,9 @@ async function startBot() {
 
             if (response.data?.candidates?.[0]?.content?.parts?.[0]?.text) {
                 let reply = response.data.candidates[0].content.parts[0].text.trim();
+
+                // Reply ko history mein save karo — taaki agla message bhi context ke saath aaye
+                pushHistory(realNum, "model", reply);
                 
                 // Realistic typing delay — message length ke hisaab se
                 const typingDelay = Math.min(1500 + reply.length * 30, 5000);
@@ -249,8 +282,10 @@ async function startBot() {
             console.log(`❌ AI Error: ${errMsg}`);
 
             // User ko bilkul silence na mile — agar sab retries fail ho jaye toh fallback message
+            const fallback = "Ek second... thoda busy hu, abhi reply karta hu 🙈";
+            pushHistory(realNum, "model", fallback);
             try {
-                await sock.sendMessage(rawJid, { text: "Ek second... thoda busy hu, abhi reply karta hu 🙈" }, { quoted: msg });
+                await sock.sendMessage(rawJid, { text: fallback }, { quoted: msg });
             } catch (_) {}
         }
     });
@@ -339,6 +374,7 @@ app.post('/api/contacts/remove', ariseAuth, (req, res) => {
     if (!config.contacts[cleanNum]) return res.json({ success: false, error: "Contact nahi mila" });
     delete config.contacts[cleanNum];
     saveConfig(config);
+    chatHistory.delete(cleanNum);   // Memory bhi clear karo
     console.log(`🗑️ Contact removed: ${cleanNum}`);
     res.json({ success: true, message: `${cleanNum} removed` });
 });
@@ -368,6 +404,7 @@ app.post('/api/contacts/update-type', ariseAuth, (req, res) => {
     if (!config.contacts[cleanNum]) return res.json({ success: false, error: "Contact nahi mila" });
     config.contacts[cleanNum].type = type;
     saveConfig(config);
+    chatHistory.delete(cleanNum);   // Type badla — purana persona context clear karo
     res.json({ success: true, message: `${cleanNum} type updated to ${type}` });
 });
 
