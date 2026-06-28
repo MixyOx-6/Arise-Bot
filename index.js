@@ -205,12 +205,31 @@ async function startBot() {
 
         const systemPrompt = getSystemPrompt(contactConfig.type, contactConfig.name, text);
 
+        // Gemini ko call karo — overload (503) ya temporary errors pe retry karo
+        async function callGemini(retriesLeft = 2) {
+            try {
+                const response = await axios.post(
+                    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${config.gemini_key}`,
+                    { contents: [{ parts: [{ text: systemPrompt }] }] },
+                    { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+                );
+                return response;
+            } catch (e) {
+                const status = e.response?.status;
+                const errMsg = e.response?.data?.error?.message || e.message;
+                const isOverload = status === 503 || status === 429 || /overload|high demand|unavailable/i.test(errMsg);
+
+                if (isOverload && retriesLeft > 0) {
+                    console.log(`⏳ Model busy (${status}) — retrying in 3s... (${retriesLeft} left)`);
+                    await new Promise(r => setTimeout(r, 3000));
+                    return callGemini(retriesLeft - 1);
+                }
+                throw e;
+            }
+        }
+
         try {
-            const response = await axios.post(
-                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${config.gemini_key}`,
-                { contents: [{ parts: [{ text: systemPrompt }] }] },
-                { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
-            );
+            const response = await callGemini();
 
             if (response.data?.candidates?.[0]?.content?.parts?.[0]?.text) {
                 let reply = response.data.candidates[0].content.parts[0].text.trim();
@@ -228,6 +247,11 @@ async function startBot() {
         } catch (e) {
             const errMsg = e.response?.data?.error?.message || e.message;
             console.log(`❌ AI Error: ${errMsg}`);
+
+            // User ko bilkul silence na mile — agar sab retries fail ho jaye toh fallback message
+            try {
+                await sock.sendMessage(rawJid, { text: "Ek second... thoda busy hu, abhi reply karta hu 🙈" }, { quoted: msg });
+            } catch (_) {}
         }
     });
 }
