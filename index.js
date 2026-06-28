@@ -207,7 +207,7 @@ async function startBot() {
 
         try {
             const response = await axios.post(
-                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${config.gemini_key}`,
+                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${config.gemini_key}`,
                 { contents: [{ parts: [{ text: systemPrompt }] }] },
                 { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
             );
