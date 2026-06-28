@@ -36,7 +36,7 @@ let sock;
 // Har contact ki recent chat history yaad rakhne ke liye — RAM mein (server restart
 // hone pe reset ho jayegi, woh normal hai). Isi se bot ko "context" milta hai.
 const chatHistory = new Map();      // number -> [{ role: "user"|"model", text }]
-const MAX_TURNS = 10;               // last 10 messages (5 user + 5 bot) yaad rakhega
+const MAX_TURNS = 8;                // last 8 messages yaad rakhega — payload chhota, fast
 
 function getHistory(number) {
     if (!chatHistory.has(number)) chatHistory.set(number, []);
@@ -46,8 +46,29 @@ function getHistory(number) {
 function pushHistory(number, role, text) {
     const hist = getHistory(number);
     hist.push({ role, text });
-    // Purani history trim karo — sirf last MAX_TURNS rakho
     while (hist.length > MAX_TURNS) hist.shift();
+}
+
+// ─── MESSAGE DEBOUNCE ─────────────────────────────────────────────────────────
+// Agar user fata-fat 2-3 messages bhejta hai, hum sabko ek saath jodke EK hi
+// Gemini call bhejte hain — isse rate limit hit hone ka chance bahut kam ho jaata hai
+// aur bot ko bhi pura context milta hai (jaisa real insaan ek saath padhta hai).
+const pendingMessages = new Map();   // number -> { texts: [], timer }
+const DEBOUNCE_MS = 2500;            // 2.5 sec wait karo agla message aane ke liye
+
+// ─── GLOBAL RATE LIMITER ──────────────────────────────────────────────────────
+// Free tier Gemini ki per-minute limit cross na ho — saari requests ke beech
+// minimum gap maintain karte hain (chahe alag-alag number se hi aa rahi ho).
+let lastApiCallAt = 0;
+const MIN_GAP_MS = 4000;             // har Gemini call ke beech kam se kam 4 sec gap
+
+async function waitForRateLimit() {
+    const now = Date.now();
+    const elapsed = now - lastApiCallAt;
+    if (elapsed < MIN_GAP_MS) {
+        await new Promise(r => setTimeout(r, MIN_GAP_MS - elapsed));
+    }
+    lastApiCallAt = Date.now();
 }
 
 // ─── ARISE APP AUTH MIDDLEWARE ────────────────────────────────────────────────
@@ -220,20 +241,36 @@ async function startBot() {
 
         console.log(`💬 [${contactConfig.type}] ${realNum}: ${text}`);
 
+        // ── DEBOUNCE — agar 2.5 sec ke andar agla message bhi aaya, dono ko jodke ek call karenge
+        if (!pendingMessages.has(realNum)) {
+            pendingMessages.set(realNum, { texts: [], timer: null });
+        }
+        const pending = pendingMessages.get(realNum);
+        pending.texts.push(text);
+        if (pending.timer) clearTimeout(pending.timer);
+
+        pending.timer = setTimeout(() => {
+            const combinedText = pending.texts.join('\n');
+            pendingMessages.delete(realNum);
+            processMessage(realNum, rawJid, msg, contactConfig, combinedText);
+        }, DEBOUNCE_MS);
+    });
+
+    async function processMessage(realNum, rawJid, msg, contactConfig, text) {
         const systemPrompt = getSystemPrompt(contactConfig.type, contactConfig.name);
 
         // Is contact ki purani history nikalo aur naya user message add karo
         pushHistory(realNum, "user", text);
         const history = getHistory(realNum);
 
-        // Gemini ke format mein convert karo: history ka pehla message system instruction ke saath jaata hai
-        const geminiContents = history.map((h, i) => ({
+        const geminiContents = history.map((h) => ({
             role: h.role === "user" ? "user" : "model",
             parts: [{ text: h.text }]
         }));
 
-        // Gemini ko call karo — overload (503) ya temporary errors pe retry karo
+        // Gemini ko call karo — global rate limit ka wait + overload pe retry
         async function callGemini(retriesLeft = 2) {
+            await waitForRateLimit();
             try {
                 const response = await axios.post(
                     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${config.gemini_key}`,
@@ -250,8 +287,8 @@ async function startBot() {
                 const isOverload = status === 503 || status === 429 || /overload|high demand|unavailable/i.test(errMsg);
 
                 if (isOverload && retriesLeft > 0) {
-                    console.log(`⏳ Model busy (${status}) — retrying in 3s... (${retriesLeft} left)`);
-                    await new Promise(r => setTimeout(r, 3000));
+                    console.log(`⏳ Model busy (${status}) — retrying in 5s... (${retriesLeft} left)`);
+                    await new Promise(r => setTimeout(r, 5000));
                     return callGemini(retriesLeft - 1);
                 }
                 throw e;
@@ -288,7 +325,7 @@ async function startBot() {
                 await sock.sendMessage(rawJid, { text: fallback }, { quoted: msg });
             } catch (_) {}
         }
-    });
+    }
 }
 
 startBot();
